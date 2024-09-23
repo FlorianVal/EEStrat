@@ -1,19 +1,15 @@
 import torch
-from torch.utils.data import DataLoader
-from collections import defaultdict
-from typing import List, Dict, Tuple
-from src.model import BranchyResNet
 
 
 def discretize(value, steps):
     if not isinstance(value, torch.Tensor):
         value = torch.tensor(value)
-
     if torch.any(value < 0) or torch.any(value > 1):
-        raise ValueError("All values must be between 0 and 1")
+        min_val, max_val = value.min().item(), value.max().item()
+        raise ValueError(f"All values must be between 0 and 1, but found values in range [{min_val}, {max_val}]")
 
     if steps < 2:
-        raise ValueError("Number of steps must be at least 2")
+        raise ValueError(f"Number of steps must be at least 2, but got {steps}")
 
     step_size = 1 / (steps - 1)
     discretized_value = torch.round(value / step_size) * step_size
@@ -26,25 +22,28 @@ def discretize(value, steps):
     return torch.round(discretized_value * 10**decimals) / (10**decimals)
 
 
-def build_path_count_dict(model, dataloader):
+def build_path_count_dict(model, dataloader, device, discretization_steps=10):
     """Builds a dictionary of paths and their counts for each head in the model.
 
     Returns:
-        Lists[Dict]: A list of dictionaries, where each dictionary corresponds to a head in the model.
+        Dict[str, Dict]: A dictionary of dictionaries, where each inner dictionary corresponds to a head in the model.
     """
-    count_path_dicts = [{} for i in range(len(model.branches))]
+    count_path_dicts = {f"head_{i}": {} for i in range(len(model.branches))}
     model.yield_mode = False
 
     for x, y in dataloader:
-        max_preds = torch.max(
-            model(x), dim=-1
-        )  # Return max prob of shape [Heads, Batch]
-        max_preds = discretize(max_preds.values, 10)
-        for head in range(max_preds.shape[0]):
-            keys = torch.cat((max_preds[: head + 1].T, y.unsqueeze(1)), dim=1)
-            for key in keys:
-                key = tuple([round(x, 5) for x in key.tolist()])
-                count_path_dicts[head][key] = count_path_dicts[head].get(key, 0) + 1
+        x, y = x.to(device), y.to(device)
+        outputs = model(x)
+        softmaxed_outputs = torch.nn.functional.softmax(outputs, dim=-1)
+        max_preds, pred_indices = torch.max(softmaxed_outputs, dim=-1)
+        max_preds = discretize(max_preds, discretization_steps)
+        for head in range(max_preds.shape[0] - 1):
+            keys = []
+            for i in range(head + 1):
+                keys.append(((max_preds[head][i].item(), 5), pred_indices[head][i].item()))
+            keys.append(y[head].item())
+            key = tuple(keys)
+            count_path_dicts[f"head_{head}"][key] = count_path_dicts[f"head_{head}"].get(key, 0) + 1
     return count_path_dicts
 
 
@@ -54,85 +53,57 @@ def build_probs_dict(count_path_dicts):
     Returns:
         Lists[Dict]: A list of dictionaries, where each dictionary corresponds to a head in the model.
     """
-    probs_dicts = []
-    for count_path_dict in count_path_dicts:
-        probs_dict = {}
+    probs_dicts = {}
+    for _, count_path_dict in count_path_dicts.items():
+        total_count = sum(count_path_dict.values())
         for key, value in count_path_dict.items():
-            probs_dict[key] = value / sum(count_path_dict.values())
-        probs_dicts.append(probs_dict)
+            probs_dicts[key] = value / total_count
     return probs_dicts
 
 
-def estimate_conditional_probabilities(
-    model: BranchyResNet,
-    dataloader: DataLoader,
-    num_classes: int,
-    discretization_steps: int = 10,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> List[Dict[Tuple, List[float]]]:
+def compute_continuation_cost(M, K, c, P, P_set, X_set, A):
     """
-    Estimate conditional probabilities for each branch of the BranchyResNet model.
+    Compute the continuation costs for a multi-head model.
 
     Args:
-        model (BranchyResNet): The BranchyResNet model.
-        dataloader (DataLoader): DataLoader for the dataset.
-        num_classes (int): Number of classes in the dataset.
-        discretization_steps (int): Number of steps for discretization.
-        device (str): Device to run the model on.
+        M (int): Number of heads in the model
+        K (int): Number of classes
+        c (List[float]): Array of computational costs for each head
+        P (Dict): Conditional probabilities computed earlier
+        P_set (List[Tuple]): Set of all possible discretized belief states
+        X_set (List[float]): Set of all possible discretized outputs
+        A (torch.Tensor): Cost matrix where A[j,k] is the cost of predicting class k when true class is j
 
     Returns:
-        List[Dict[Tuple, List[float]]]: Estimated conditional probabilities for each branch.
+        Dict: Table of continuation costs
     """
-    model.eval()
-    model.to(device)
+    
+    V = {(h, p): float("inf") for h in range(M) for p in P_set}
 
-    # Initialize counters for each branch
-    branch_counters = [
-        defaultdict(lambda: [0] * num_classes) for _ in range(len(model.branches) + 1)
-    ]
+    def f(p):
+        return torch.min(torch.sum(A * torch.tensor(p).unsqueeze(1), dim=0)).item()
 
-    # Count occurrences
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
+    def update_belief(p, xi, P):
+        p_next = []
+        denominator = sum(P.get((xi, p, j), 0) * p[j] for j in range(K))
+        for k in range(K):
+            p_next.append(
+                P.get((xi, p, k), 0) * p[k] / denominator if denominator != 0 else 0
+            )
+        return tuple(p_next)
 
-            model.yield_mode = False
-            branch_outputs = model(inputs)
-
-            for branch_idx, branch_output in enumerate(branch_outputs):
-                probs = torch.softmax(branch_output, dim=1)
-
-                for i, label in enumerate(labels):
-                    # Create a tuple of discretized probabilities for previous branches
-                    prev_probs = tuple(
-                        discretize(
-                            torch.softmax(prev_output[i], dim=0).max().item(),
-                            discretization_steps,
-                        )
-                        for prev_output in branch_outputs[:branch_idx]
-                    )
-
-                    # Discretize the current branch's probability
-                    current_prob = discretize(
-                        probs[i].max().item(), discretization_steps
-                    )
-
-                    # Update the counter
-                    key = prev_probs + (current_prob,)
-                    branch_counters[branch_idx][key][label.item()] += 1
-
-    # Calculate conditional probabilities
-    conditional_probs = []
-    for branch_counter in branch_counters:
-        branch_probs = {}
-        for key, counts in branch_counter.items():
-            total = sum(counts)
-            if total > 0:
-                branch_probs[key] = [count / total for count in counts]
+    for h in range(M - 1, -1, -1):
+        for p in P_set:
+            if h == M - 1:
+                V[(h, p)] = f(p)
             else:
-                branch_probs[key] = [
-                    1 / num_classes
-                ] * num_classes  # Uniform distribution if no data
-        conditional_probs.append(branch_probs)
+                cost = c[h + 1]
+                for xi in X_set:
+                    p_next = update_belief(p, xi, P)
+                    P_xi_given_p = sum(P.get((xi, p, k), 0) * p[k] for k in range(K))
+                    cost += P_xi_given_p * min(
+                        f(p_next), V.get((h + 1, p_next), float("inf"))
+                    )
+                V[(h, p)] = cost
 
-    return conditional_probs
+    return V

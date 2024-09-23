@@ -5,7 +5,7 @@ from src.utils import discretize
 def test_discretize_basic():
     assert discretize(0.6, 3) == 0.5  # 3 step is 0, 0.5, 1
     assert discretize(0.7, 5) == 0.75  # 5 steps is 0, 0.25, 0.5, 0.75, 1
-    assert round(discretize(0.3, 4), 2) == 0.33
+    assert round(discretize(0.3, 4).item(), 2) == 0.33
 
 
 def test_discretize_edge_cases():
@@ -20,9 +20,9 @@ def test_discretize_many_steps():
 
 
 def test_discretize_value_out_of_range():
-    with pytest.raises(ValueError, match="Value must be between 0 and 1"):
+    with pytest.raises(ValueError, match="All values must be between 0 and 1, but found values in range"):
         discretize(-0.1, 3)
-    with pytest.raises(ValueError, match="Value must be between 0 and 1"):
+    with pytest.raises(ValueError, match="All values must be between 0 and 1, but found values in range"):
         discretize(1.1, 3)
 
 

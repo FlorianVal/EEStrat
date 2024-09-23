@@ -59,6 +59,7 @@ class BranchyResNet(nn.Module):
         """
         super(BranchyResNet, self).__init__()
         self.yield_mode = yield_mode
+        self.num_classes = num_classes
 
         # Initialize base model
         if base_model == "resnet18":
@@ -143,19 +144,19 @@ class BranchyResNet(nn.Module):
         Returns:
             torch.Tensor: Concatenated outputs from all branches and final classification.
         """
-        outputs = []
-        for layer, branch in zip(self.layers, self.branches):
+        outputs = torch.empty((len(self.branches) + 1, x.size(0), self.num_classes), device=x.device)
+        for i, (layer, branch) in enumerate(zip(self.layers, self.branches)):
             x = layer(x)
-            outputs.append(branch(x))
+            outputs[i] = branch(x)
 
         # Final classification
         x = self.final_layer(x)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.fc(x)
-        outputs.append(x)
+        outputs[-1] = x
 
-        return torch.stack(outputs)
+        return outputs
 
     def forward(
         self, x: torch.Tensor

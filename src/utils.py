@@ -37,13 +37,17 @@ def build_path_count_dict(model, dataloader, device, discretization_steps=10):
         softmaxed_outputs = torch.nn.functional.softmax(outputs, dim=-1)
         max_preds, pred_indices = torch.max(softmaxed_outputs, dim=-1)
         max_preds = discretize(max_preds, discretization_steps)
+        print(max_preds.shape)
+        print(y.shape)
         for head in range(max_preds.shape[0] - 1):
             keys = []
             for i in range(head + 1):
-                keys.append(((max_preds[head][i].item(), 5), pred_indices[head][i].item()))
+                keys.append((round(max_preds[head][i].item(), 5), pred_indices[head][i].item()))
+            
             keys.append(y[head].item())
             key = tuple(keys)
             count_path_dicts[f"head_{head}"][key] = count_path_dicts[f"head_{head}"].get(key, 0) + 1
+        print(count_path_dicts)
     return count_path_dicts
 
 
